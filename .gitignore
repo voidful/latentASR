@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# OS/editor metadata
+.DS_Store
+.vscode/
+.idea/
+
+# Local agent/tool state
+.agents/
+.claude/
+.codex/
+.git/
+
+# Runtime outputs
+logs/
+eval_runs/
+core
+core.*
+*.log
+
+# Model checkpoints and adapter weights
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+lora_r16_qwen_asr_best/
+
+# Local data/cache folders
+dataset/
+datasets/
+hf_cache/
+wandb/
