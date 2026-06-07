@@ -1,0 +1,36 @@
+[project]
+name = "latentASR"
+version = "0.1.0"
+description = "Continuous latent test-time scaling for frozen Qwen3-ASR backbones."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "LatentASR contributors" }
+]
+dependencies = [
+  "torch>=2.6",
+  "torchaudio>=2.6",
+  "transformers>=4.57",
+  "datasets>=3.6",
+  "huggingface-hub>=0.34",
+  "qwen-asr>=0.0.6",
+  "qwen-omni-utils>=0.0.8",
+  "jiwer>=4.0",
+  "peft>=0.18",
+  "numpy>=1.24",
+  "tqdm>=4.66"
+]
+
+[tool.setuptools]
+py-modules = [
+  "config",
+  "data",
+  "eval",
+  "losses",
+  "model",
+  "peft_utils",
+  "train",
+  "utils"
+]
+

@@ -1,0 +1,453 @@
+\documentclass[a4paper]{article}
+\usepackage{ISCSLP2026}
+\usepackage{iftex}
+\ifPDFTeX\else
+  \usepackage{fontspec}
+  \setmainfont{TeX Gyre Termes}
+  \setmonofont{TeX Gyre Cursor}
+\fi
+\usepackage{ifthen}
+\newboolean{blind}
+\setboolean{blind}{true}
+
+%==================================================================================
+% Packages
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{bm}
+\usepackage{multirow}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, fit, backgrounds, calc, decorations.pathreplacing}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{comment}
+
+%==================================================================================
+% Custom commands
+\newcommand{\method}{LatentASR}
+\newcommand{\vdelta}{\boldsymbol{\delta}}
+
+%==================================================================================
+% Title and Authors (ISCSLP-style: name/address/email with blind toggle)
+\title{Listen, Think, Transcribe: Continuous Latent Test-Time Scaling for ASR}
+
+\name{
+	\ifthenelse{\boolean{blind}}{Anonymous to ISCSLP}
+	{Name$^1$, Co-author Name$^2$}
+}
+
+\address{
+  \ifthenelse{\boolean{blind}}{Anonymous to ISCSLP}
+  {
+  	$^1$Author Affiliation\\
+  $^2$Co-author Affiliation
+  }
+}
+
+\email{
+	\ifthenelse{\boolean{blind}}{Anonymous to ISCSLP}
+	{author@university.edu, coauthor@company.com}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+End-to-end ASR models transcribe in a single pass, leaving no room for the decoder to revisit hard inputs. We propose \emph{LatentASR}, a parameter-efficient method that adds continuous latent test-time scaling to a frozen ASR backbone. Two small trainable modules drive it: a Latent Adapter that iteratively refines a few latent prefix positions through bounded, stabilized updates, and a Value Head that predicts whether extra computation will help and halts the loop early. The Qwen3-ASR-0.6B backbone stays fully frozen, and we train only ${\sim}5.25$M extra parameters. We activate this loop with a deliberately small, diverse 500-utterance training set. Under this minimal-data regime, standard adaptation methods regress: full fine-tuning, LoRA, and prompt tuning each increase WER on the two clean main benchmarks. \method{} instead gives the only negative single-run point estimate on both clean benchmarks, lowering FLEURS WER from $4.900\%$ to $4.776\%$ and VoxPopuli WER from $9.038\%$ to $8.995\%$. These clean-set deltas are small and should be read as directional rather than as statistically established gains. Same-protocol diagnostics on multilingual and noisy stress conditions suggest that the latent loop preserves the frozen backbone while converting fixed per-utterance compute into input-dependent compute. Dynamic halting allocates compute sparsely on clean read speech, skipping $47.0\%$ of FLEURS and $63.0\%$ of VoxPopuli utterances at the entry gate. Our results suggest that a small, carefully chosen activation set can switch on input-dependent latent computation inside a frozen ASR model without adapting, and thereby corrupting, the model itself.
+\end{abstract}
+\noindent\textbf{Index Terms}: automatic speech recognition, latent test-time scaling, continuous thought, parameter-efficient finetuning
+
+\section{Introduction}
+
+End-to-end automatic speech recognition (ASR) models map audio directly to text in a single forward pass~\cite{radford2023robust,peng2025owsm}. This design is simple and effective. However, it forces a single left-to-right decoder to handle acoustic disambiguation, language modeling, and error correction at the same time.
+
+Recent work has shown that allocating extra computation at inference time can substantially improve model performance. This paradigm is broadly known as test-time scaling, and includes explicit chain-of-thought reasoning~\cite{wei2022chain}, parallel sampling, and iterative refinement. Within this line, latent test-time scaling has drawn growing attention. For example, Coconut replaces discrete chain-of-thought tokens with continuous hidden states that are iteratively fed back into the model~\cite{hao2024training}. Quiet-STaR trains models to generate and exploit implicit thoughts to improve next-token prediction~\cite{zelikman2024quiet}. Pause tokens provide extra compute steps without requiring explicit intermediate text~\cite{goyal2024think}. Overall, these findings suggest that latent compute scaling is particularly beneficial on challenging inputs.
+
+Motivated by this, we ask a simple question. Can an ASR decoder benefit from latent test-time scaling before it commits to a transcript?
+
+Applying continuous latent scaling to ASR introduces two challenges absent in standard NLP tasks. First, ASR is a direct transcription task with no intermediate reasoning trajectory to distill, unlike Coconut and Quiet-STaR which rely on explicit chain-of-thought rationales. The model must discover how to use extra latent computation entirely unsupervised. Second, modern ASR backbones are typically kept frozen for efficiency and zero-shot generalization. Standard parameter-efficient methods (LoRA, prompt tuning, prefix tuning) follow this regime~\cite{hu2022lora,lester2021power,li2021prefix}, but recent test-time scaling techniques often fine-tune the entire backbone, which inevitably triggers catastrophic forgetting. Conversely, directly injecting unconstrained continuous states into a frozen backbone causes a geometric mismatch that pushes the decoder out of its native vocabulary distribution and leads to representation collapse.
+
+We propose \method{}, a parameter-efficient method that adds two small trainable modules (a Latent Adapter and a Value Head) to a frozen ASR backbone. The Latent Adapter refines the embeddings of $N$ latent prefix positions through bounded recurrent updates; the Value Head predicts per-utterance utility and halts the loop early. Both modules consume only decoder hidden states; the encoder and decoder weights are never updated.
+
+Our contributions are as follows:
+\begin{itemize}
+    \item We introduce continuous latent test-time scaling into frozen ASR backbones. We propose a soft-gated additive injection strategy that produces bounded updates and constructs scale-invariant compute states without triggering representation collapse. Same-protocol component ablations confirm that the stabilization mechanisms are individually important, with removal costs up to tens of WER points.
+    \item We design a Value Head that predicts per-utterance utility and halts computation when extra steps will not help. At the deployed threshold, dynamic halting uses only $1.20$ average latent steps on FLEURS and $0.70$ on VoxPopuli, while skipping $47.0\%$ and $63.0\%$ of utterances respectively. An ASCEND accented/code-switched diagnostic shows heavier compute allocation. ASCEND accounts for only $5/500$ activation utterances ($1.0\%$), but because speaker-disjointness was not enforced, we still treat this row as an overlap-confounded in-domain diagnostic rather than a headline generalization result.
+    \item We demonstrate \emph{minimal-data activation}: a small training set can \emph{activate} latent test-time scaling on a frozen backbone, while being too small to \emph{adapt} (and thereby corrupt) the backbone itself. An activation-size sweep from 100 to 800 utterances selects the 500-utterance checkpoint used for the main results. This checkpoint gives negative single-run WER point estimates on FLEURS ($-0.124$~pp) and VoxPopuli ($-0.043$~pp), while standard adaptation methods of comparable scale regress; we treat these clean-set deltas as directional and leave statistical confirmation to multi-seed paired testing.
+\end{itemize}
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Latent test-time scaling.}\quad Beyond explicit chain-of-thought reasoning~\cite{wei2022chain}, recent work injects \emph{continuous} computation into language models. Coconut~\cite{hao2024training} feeds last-layer hidden states back into the model in place of discrete tokens, allowing reasoning to proceed in a continuous embedding space. Quiet-STaR~\cite{zelikman2024quiet} trains models to generate and exploit implicit thoughts that improve next-token prediction without explicit rationale supervision. Pause tokens~\cite{goyal2024think} insert filler positions that grant the model extra forward compute without producing intermediate text. These methods primarily target language modeling and reasoning benchmarks where intermediate rationales either exist or can be distilled from teacher models. \method{} extends the latent-scaling principle to direct speech-to-text transcription, where the target sequence is the only supervision signal and the backbone must remain frozen to preserve broad acoustic generalization.
+
+\textbf{Adaptive computation.}\quad Spending variable compute per input has a long history. Adaptive Computation Time (ACT)~\cite{graves2016adaptive} learns a halting probability per step inside an RNN, terminating when accumulated halting mass exceeds a threshold. PonderNet~\cite{banino2021pondernet} reformulates this with a probabilistic framework and explicit regularization on the expected pondering steps. Early-exit transformers~\cite{schuster2022confident,xin2020deebert} cut inference cost by exiting at intermediate layers when token-level confidence is high. \method{}'s Value Head sits in this lineage but differs along two axes. First, it operates over a small fixed budget of \emph{latent prefix} positions rather than over network depth or over output sequence length; second, its halting signal is the predicted \emph{latent-vs-baseline accuracy gain}, not a confidence proxy or a learned ponder cost. The signal is therefore directly aligned with the deployment objective (``would extra compute reduce WER?''), rather than a heuristic surrogate.
+
+\textbf{Parameter-efficient adaptation.}\quad LoRA~\cite{hu2022lora}, prompt tuning~\cite{lester2021power}, and prefix tuning~\cite{li2021prefix} keep a backbone frozen while inserting low-rank weight updates or learnable surface prompts. As shown in Table~\ref{tab:main}, under our 500-utterance low-resource regime these gradient-based input or weight perturbations consistently \emph{increase} WER on a strong zero-shot ASR backbone. \method{} differs in two ways. First, it leaves both backbone weights and surface prompts untouched. Second, it does not minimize the input-output discrepancy; it instead introduces additional \emph{computation} along a bounded latent trajectory governed by a learned halting policy.
+
+\textbf{Robust pre-trained ASR.}\quad Foundation ASR models such as Whisper~\cite{radford2023robust}, OWSM~\cite{peng2025owsm}, and Qwen-ASR~\cite{yang2024qwen2audio} achieve strong zero-shot transcription via massive multilingual pre-training. Their generalization, however, is brittle: even small downstream gradient updates can erase it (Section~\ref{sec:exp_setup}). To our knowledge, \method{} is the first method to add a learnable test-time refinement loop on top of such a backbone without modifying any of its parameters, yielding negative clean-set point estimates in a regime where conventional adaptation actively regresses.
+
+\section{Method}
+
+\subsection{Problem Setup}
+\label{sec:setup}
+
+We consider an end-to-end ASR pipeline with a frozen acoustic encoder and a frozen autoregressive text decoder. Given an utterance $a$, the encoder produces acoustic states $\mathbf{Z}=\mathrm{Enc}(a)$, and the decoder generates transcript tokens conditioned on $\mathbf{Z}$ and a text prefix. \method{} keeps both the encoder and the decoder fully frozen and intervenes \emph{only} on the decoder's input prefix: it inserts $N$ \emph{latent positions} between the system prompt and the transcript target. These positions are non-text continuous slots used solely as additional computation context; no transcript token is emitted at them. We use $N$ both as the number of latent positions and as the maximum number of refinement steps: refinement step $k$ updates the embedding at latent position $k$.
+
+\subsection{Overview}
+
+\method{} adds two small trainable modules to the frozen backbone (Fig.~\ref{fig:arch}): a \textbf{Latent Adapter} that refines the embeddings at the $N$ latent positions through a bounded recurrent loop, and a \textbf{Value Head} that decides how many of those refinement steps to actually run. Both modules consume only decoder hidden states; neither modifies the backbone or the encoder. One difficulty drives the whole design. Feeding an arbitrary continuous vector into a frozen decoder pushes its input off the distribution seen during pre-training and quickly destabilizes it. The Latent Adapter therefore does not inject free vectors; it produces small, bounded, gated updates around a fixed anchor embedding, controlled by three stabilization mechanisms that we detail in Section~\ref{sec:stability}. Sections~\ref{sec:refinement}--\ref{sec:valuehead} describe each component in turn.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{latentASR.png}
+\caption{Architecture of \method{}. The ASR backbone (blue) remains \textbf{frozen}. We add a trainable \textbf{Latent Adapter} (orange) that forms a recurrent compute loop. At step $k$, it maps the decoder hidden state at latent position $k$ to a bounded update $\vdelta_k$ that is added to the latent embedding via a sigmoid gate. A \textbf{Value Head} (diamond) reads each latent state to predict a utility score $v_k$, enabling the model to halt dynamically when further computation is unnecessary.}
+\label{fig:arch}
+\end{figure}
+
+\subsection{Latent Prefix Refinement}
+\label{sec:refinement}
+
+The Latent Adapter computes a bounded update at each refinement step. Let $\mathbf{h}_0$ denote the decoder's last-layer hidden state at the final latent position before any refinement (the \emph{acoustic anchor}); we $L_2$-normalize it before downstream use so the loop starts from a unit-magnitude state. At refinement step $k\in\{1,\dots,N\}$, the frozen decoder reads $\mathbf{Z}$ and the current latent prefix; we extract the last-layer hidden state $\mathbf{h}_k$ at latent position $k$. The adapter, time-conditioned by a learned step embedding $\mathbf{e}_k$, projects $\mathbf{h}_k$ into the embedding space, $L_2$-normalizes the projection, and rescales by a learned scalar $s_k$ to produce a step-bounded delta:
+\begin{equation}
+    \vdelta_k = s_k \cdot \frac{\text{DeltaProj}(\mathbf{h}_k)}{\lVert\text{DeltaProj}(\mathbf{h}_k)\rVert + \epsilon}, \quad \epsilon{=}10^{-6}.
+    \label{eq:delta}
+\end{equation}
+The $L_2$-normalization makes the update direction scale-invariant; the per-step scale $s_k$ controls how far each step moves.
+
+\subsection{Stable Injection into a Frozen Decoder}
+\label{sec:injection}
+\label{sec:stability}
+
+A frozen decoder only interprets inputs that resemble the token embeddings it saw during pre-training. Injecting an arbitrary continuous vector pushes the input off this embedding manifold and destabilizes the decoder. \method{} keeps the injection on-manifold by constraining three distinct properties of the update: how far each step moves the state, whether the step is applied, and where the resulting embedding sits.
+
+\begin{itemize}
+    \item \textbf{Bounded delta.} The per-step scale $s_k$ and the $L_2$-normalization in Eq.~\ref{eq:delta} bound the magnitude of every update, so no single step can grow without limit.
+    \item \textbf{Sigmoid gate.} A learned gate decides how much of each update to apply:
+    \begin{equation}
+        g_k = \sigma\big(\mathbf{W}_g [\mathbf{e}_{\texttt{LT}}; \vdelta_k]\big),
+        \label{eq:gate}
+    \end{equation}
+    with $\mathbf{W}_g$ zero-initialized so $g_k{=}0.5$ at the start of training.
+    \item \textbf{Fixed-embedding anchor.} Every latent position is anchored to the same fixed token embedding $\mathbf{e}_{\texttt{LT}}$ and modified only by an additive residual,
+    \begin{equation}
+        \mathbf{x}_k = \mathbf{e}_{\texttt{LT}} + g_k \cdot \vdelta_k,
+        \label{eq:inject}
+    \end{equation}
+    so the injected embedding stays in a small ball around a real vocabulary embedding the decoder already interprets.
+\end{itemize}
+
+Together, Eqs.~\ref{eq:delta}--\ref{eq:inject} form a gated residual around a fixed anchor. Closing the gate recovers $\mathbf{e}_{\texttt{LT}}$ exactly, so the adapter only learns a small, optionally-zero correction rather than a full continuous input from scratch.
+
+\subsection{Utility Prediction and Dynamic Halting}
+\label{sec:valuehead}
+
+Latent scaling reliably helps some utterances and merely costs compute on others. We therefore need a per-utterance gate that predicts, before any compute is spent, whether further latent steps will help. The Value Head plays this role.
+
+\textbf{Design rationale.}\quad The signal we want is ``would extra latent compute help this utterance?'', which is most directly answered by comparing the latent path against the frozen baseline on the same training utterance, a self-distilled target whose value is the latent-vs-baseline accuracy gain $\Delta$ on supervised transcript positions. As the latent path improves during training, $\Delta$ can become positive on most utterances; we therefore expose a forced-negative sampling knob $p_{\text{neg}}$ that, with probability $p_{\text{neg}}$ per minibatch, flips $y \leftarrow -|y|$, providing a tunable counterweight against this drift. We default to $p_{\text{neg}}{=}0.3$. When both baseline and latent token accuracies are zero for an utterance, we replace the accuracy target for that utterance with a clamped cross-entropy-difference fallback.
+
+\textbf{Implementation.}\quad The Value Head is a single linear layer over each latent hidden state, $v_k = \tanh(\text{ValueHead}(\mathbf{h}_k)) \in [-1, 1]$, so larger $v_k$ predicts a more negative $\Delta$WER. On non-degenerate utterances the target is the tanh-squashed accuracy gain
+\begin{equation}
+    y = \alpha \cdot \tanh(\gamma \cdot \Delta),
+    \label{eq:value_target}
+\end{equation}
+with $\alpha{=}0.9$ and $\gamma{=}3.0$.
+
+\textbf{Two-stage halting at inference.}\quad $v_0$ on the initial anchor gates the entire loop: if $v_0 < \theta$, all $N$ steps are skipped and the utterance falls back to the frozen Baseline. Otherwise, after each step $k\geq 1$, we re-evaluate $v_k$ and break if it drops below $\theta$. Latent compute is thus allocated only to utterances the Value Head predicts will benefit.
+
+\subsection{Training}
+\label{sec:training}
+
+Three losses train the adapter and Value Head while the backbone stays frozen:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{\text{CE}} + w_{\text{cyc}}(t) \cdot \mathcal{L}_{\text{cyc}} + w_{\text{val}} \cdot \mathcal{L}_{\text{val}}.
+    \label{eq:loss_total}
+\end{equation}
+$\mathcal{L}_{\text{CE}}$ is cross-entropy on the transcript tokens (latent positions are masked out). $\mathcal{L}_{\text{val}}$ is the mean-squared error between the Value Head output at each produced latent state and the target in Eq.~\ref{eq:value_target}. $\mathcal{L}_{\text{cyc}}$ is a trajectory regularizer
+\begin{equation}
+\mathcal{L}_{\text{cyc}} = \tfrac{\beta}{N}\!\sum_{k=1}^{N}\!\lVert\mathbf{h}_k {-} \mathbf{h}_0\rVert_2^2 + \tfrac{1{-}\beta}{N{-}1}\!\sum_{k=1}^{N-1}\!\lVert\mathbf{h}_{k+1} {-} \mathbf{h}_k\rVert_2^2,
+\label{eq:loss_cyc}
+\end{equation}
+that anchors the latent trajectory near $\mathbf{h}_0$ and damps abrupt step-to-step jumps, with $\beta{=}0.3$ favoring smooth refinement over rigid attachment. The cycle weight $w_{\text{cyc}}(t)$ decays linearly to zero. To prevent over-reliance on the latent path, we additionally drop the entire latent loop with probability $p_{\text{drop}}$ during training and add Gaussian noise of std $\sigma$ to the initial anchor.
+
+\section{Experiments}
+\subsection{Experiment Setup}
+\label{sec:exp_setup}
+
+\textbf{Training Setup.}\quad We use Qwen3-ASR-0.6B~\cite{yang2024qwen2audio} as the base model and keep all its parameters frozen. We train for 10 epochs with effective batch size $16$ on a single NVIDIA RTX 5090. We set $N{=}4$ and use AdamW with decoupled learning rates: $10^{-4}$ for the Latent Adapter and Value Head, and $5 \times 10^{-5}$ for step scales (initialized at $0.2$, capped at $3.0$). We use $w_{\text{cyc}}{=}0.1$ (linearly decayed), $w_{\text{val}}{=}3.0$, $p_{\text{drop}}{=}0.15$, input noise $\sigma{=}0.5$, and $p_{\text{neg}}{=}0.3$. With this configuration, the trainable components add only $\sim 5.25\text{M}$ parameters.
+
+\textbf{Dataset: Minimal-Data Activation.}\quad We construct a 500-utterance training mixture from seven ASR corpora. The mixture is dominated by Common Voice 16.0~\cite{commonvoice:2020}, supplemented by FLEURS~\cite{fleurs2022arxiv} and VoxPopuli~\cite{wang-etal-2021-voxpopuli}, and regularized with challenging tail samples from LibriSpeech~\cite{panayotov2015librispeech}, GigaSpeech~\cite{GigaSpeech2021}, The People's Speech~\cite{DBLP:journals/corr/abs-2111-09344}, and ASCEND~\cite{lovenia2022ascend}. It is strongly multilingual, covering 100+ language codes and intentionally including fragmented English dialect tags. We refer to this principle as \emph{minimal-data activation}: the small, varied training set is enough to activate latent test-time scaling, but too small to adapt the frozen backbone off its pre-trained manifold. We evaluate on the standardized FLEURS (\texttt{en\_us}) test set and VoxPopuli (\texttt{en}). \emph{Disclosure.} The 500-utterance activation set is sampled from an 811-utterance mixture with seed 42. Its corpus counts are 350 Common Voice, 77 FLEURS, 52 VoxPopuli, 8 LibriSpeech, 5 ASCEND, 4 People's Speech, and 4 GigaSpeech utterances. Thus ASCEND contributes only $5/500$ activation utterances ($1.0\%$). However, ASCEND and FLEURS/VoxPopuli each contribute to both the activation mixture (drawn from training splits) and held-out test conditions (standardized test splits), and we did not enforce speaker-disjointness between train and test. For this reason, ASCEND is not used as a headline generalization result; it is reported only as an overlap-confounded diagnostic of accented/code-switched behavior. A leave-ASCEND-out activation run is required before making a cross-domain claim on ASCEND.
+
+\textbf{Baselines and checkpoint selection.}\quad We benchmark \method{} against the frozen Qwen3-ASR-0.6B baseline, full fine-tuning, LoRA~\cite{hu2022lora} (rank 16), and prompt tuning~\cite{lester2021power} (4 soft tokens). All methods are trained for 10 epochs on the same 500-utterance mixture. Full fine-tuning was rerun with micro-batch 4 and gradient accumulation 4 after the larger micro-batch OOMed, preserving effective batch size 16. For the main \method{} row, we use the best 500-utterance $N{=}4$, $\theta{=}0$ checkpoint from the activation-size sweep, \texttt{activation\_500\_epoch10.pth}. Some ablation and cross-domain diagnostics below use independently retrained same-protocol checkpoints; we label these as diagnostics rather than as the canonical main estimate.
+
+\subsection{Main Results}
+\label{sec:main_results}
+
+Table~\ref{tab:main} reports single-run point estimates on FLEURS (\texttt{en\_us}) and VoxPopuli (\texttt{en}). Throughout this paper, all reductions are reported as the relative change in WER (or CER) over the frozen Baseline; \textbf{a negative value indicates a WER reduction (improvement)} and a positive value indicates an increase (regression). Across both test sets, every conventional adaptation method we test increases WER under the 500-utterance training regime. LoRA regresses by $+31.97\%$ relative on FLEURS, full fine-tuning by $+13.38\%$, and prompt tuning collapses outright (FLEURS WER rises to $84.803\%$).
+
+In contrast, \method{} is the only tested adaptation mechanism with a negative $\Delta$WER point estimate on both clean benchmarks. On FLEURS, the canonical 500-utterance checkpoint changes WER from $4.900\%$ to $4.776\%$ ($-0.124$~pp, $-2.54\%$ relative). On VoxPopuli, it changes WER from $9.038\%$ to $8.995\%$ ($-0.043$~pp, $-0.47\%$ relative). These absolute deltas are small. Because we do not yet have multi-seed runs or paired confidence intervals for the canonical checkpoint, we do not interpret Table~\ref{tab:main} as evidence of statistically significant clean-benchmark improvement. Its narrower role is to show that, in the same low-resource regime where conventional adaptation clearly regresses, latent test-time computation preserves the frozen backbone and gives a negative directional estimate.
+
+\begin{table}[ht]
+  \caption{Single-run WER and CER point estimates on the FLEURS (\texttt{en\_us}, 647 utts) and VoxPopuli (\texttt{en}, 1{,}842 utts) test splits. \textbf{Rel. $\boldsymbol{\Delta}$WER (\%)} is computed from unrounded WER against the frozen Baseline. Negative = WER reduction (improvement); positive = WER increase (regression). The clean-set \method{} deltas are directional and not claimed statistically significant.}
+  \label{tab:main}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l | c c c | c c c}
+    \toprule
+    \multirow{2}{*}{\textbf{Model}} & \multicolumn{3}{c|}{\textbf{FLEURS}} & \multicolumn{3}{c}{\textbf{VoxPopuli}} \\
+    \cmidrule(lr){2-4} \cmidrule(lr){5-7}
+     & \textbf{WER (\%)} & \textbf{CER (\%)} & \textbf{Rel.\ $\Delta$WER (\%)} & \textbf{WER (\%)} & \textbf{CER (\%)} & \textbf{Rel.\ $\Delta$WER (\%)} \\
+    \midrule
+    Baseline                 & 4.900 & 2.326 & -- & 9.038 & 5.900 & -- \\
+    \quad + Full Fine-Tuning & 5.556 & 2.481 & $+13.38$ & 9.485 & 6.176 & $+4.96$ \\
+    \quad + Prompt Tuning    & 84.803 & 82.468 & $+1630.70$ & 88.507 & 87.901 & $+879.33$ \\
+    \quad + LoRA (rank 16)   & 6.467 & 2.944 & $+31.97$ & 10.212 & 6.536 & $+13.00$ \\
+    \midrule
+    \quad + \method{} ($N{=}4$, $\theta{=}0$) & \textbf{4.776} & \textbf{2.238} & $\boldsymbol{-2.54}$ & \textbf{8.995} & \textbf{5.869} & $\boldsymbol{-0.47}$ \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\subsection{Multilingual and Cross-Domain Generalization}
+\label{sec:multilingual}
+
+To verify that \method{} preserves the broad multilingual capability of the frozen backbone, we evaluate on a 23{,}049-utterance multilingual benchmark spanning the FLEURS test sets of 30 languages. This suite is a same-protocol diagnostic and is reported to test whether the latent adapter preserves broad multilingual behavior.
+
+\begin{table}[ht]
+  \caption{Multilingual aggregate WER on FLEURS 30 and its resource-tier partitions. Rel.\ $\Delta$WER is computed against the frozen Baseline; negative = WER reduction = improvement.}
+  \label{tab:multilingual_agg}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l r c c c}
+    \toprule
+    \textbf{Subset} & \textbf{\#utts} & \textbf{Baseline WER (\%)} & \textbf{\method{} WER (\%)} & \textbf{Rel.\ $\Delta$WER (\%)} \\
+    \midrule
+    FLEURS 30 (all)         & 23{,}049 & 32.65 & \textbf{32.57} & $-0.23$ \\
+    \quad core12            &  8{,}876 & 31.71 & \textbf{31.63} & $-0.26$ \\
+    \quad +8                &  5{,}597 & 17.48 & \textbf{17.45} & $-0.19$ \\
+    \quad +10               &  8{,}576 & 43.52 & \textbf{43.42} & $-0.23$ \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\begin{table}[ht]
+  \caption{Per-language results on character-based FLEURS languages. Negative Rel.\ $\Delta$CER = error reduction = improvement.}
+  \label{tab:per_language}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l r c c c}
+    \toprule
+    \textbf{Language (FLEURS code)} & \textbf{\#utts} & \textbf{Baseline CER (\%)} & \textbf{\method{} CER (\%)} & \textbf{Rel.\ $\Delta$CER (\%)} \\
+    \midrule
+    Mandarin (cmn\_hans\_cn)  &   945 & 47.94 & \textbf{47.58} & $-0.75$ \\
+    Cantonese (yue\_hant\_hk) &   819 & 49.20 & \textbf{48.80} & $-0.82$ \\
+    Japanese (ja\_jp)         &   650 & 10.35 & 10.35 & $\phantom{-}0.00$ \\
+    Thai (th\_th)             & 1{,}021 & 9.53 & \textbf{9.41} & $\boldsymbol{-1.31}$ \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\subsection{Robustness and In-Domain Diagnostics}
+\label{sec:robustness}
+
+We further evaluate same-protocol checkpoints under acoustic shift. Table~\ref{tab:robustness} reports additive Gaussian noise at SNR $=0$~dB on FLEURS and VoxPopuli. It also includes ASCEND, evaluated with CER following~\cite{lovenia2022ascend}, but this row has a different evidential status: ASCEND contributes only $5/500$ activation utterances ($1.0\%$), yet speaker-disjointness was not enforced. The $16.02\%$ relative CER reduction on ASCEND is therefore an overlap-confounded in-domain diagnostic, not a cross-domain or speaker-independent generalization result.
+
+\begin{table}[ht]
+  \caption{Robustness and in-domain diagnostics. Rel.\ $\Delta$ is the relative WER (or CER) change vs.\ the Baseline; negative = error reduction = improvement. ASCEND$^\dagger$ accounts for only $5/500$ activation utterances ($1.0\%$), but remains overlap-confounded because speaker-disjointness was not enforced, so it is not used as headline generalization evidence.}
+  \label{tab:robustness}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l l c c c c}
+    \toprule
+    \textbf{Dataset} & \textbf{Condition} & \textbf{Metric} & \textbf{Baseline (\%)} & \textbf{\method{} (\%)} & \textbf{Rel.\ $\Delta$ (\%)} \\
+    \midrule
+    FLEURS    & SNR$=0$~dB & WER & 29.81 & \textbf{29.42} & $-1.32$ \\
+    VoxPopuli & SNR$=0$~dB & WER & 19.71 & \textbf{19.51} & $-1.02$ \\
+    \midrule
+    ASCEND$^\dagger$ & accented / code-switched & CER & 57.81 & 48.55 & $-16.02$ \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\begin{table}[ht]
+  \caption{Stress broad suite at SNR$=0$~dB. Weighted aggregate WER drops by $-0.58$~pp ($-1.57\%$ rel).}
+  \label{tab:stress_broad}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l r c c c c}
+    \toprule
+    \textbf{Dataset} & \textbf{\#utts} & \textbf{Baseline WER (\%)} & \textbf{\method{} WER (\%)} & \textbf{$\Delta$WER (pp)} & \textbf{Rel.\ $\Delta$WER (\%)} \\
+    \midrule
+    AMI (IHM+SDM) $0$~dB              &   996 & 77.784 & \textbf{75.518} & $\boldsymbol{-2.266}$ & $\boldsymbol{-2.91}$ \\
+    Common Voice (en) $0$~dB          &   500 & 31.617 & 31.936 & $+0.319$ & $+1.01$ \\
+    GigaSpeech (test) $0$~dB          &   391 & 20.939 & \textbf{20.875} & $-0.064$ & $-0.30$ \\
+    LibriSpeech (clean+other) $0$~dB  & 1{,}000 & 18.471 & 18.584 & $+0.113$ & $+0.61$ \\
+    People's Speech $0$~dB            &   500 & 31.687 & 31.771 & $+0.084$ & $+0.26$ \\
+    TEDLIUM (release 1) $0$~dB        &   500 & 14.849 & \textbf{14.291} & $-0.558$ & $-3.76$ \\
+    \midrule
+    \textbf{Weighted aggregate}       & \textbf{3{,}887} & \textbf{36.843} & \textbf{36.265} & $\boldsymbol{-0.578}$ & $\boldsymbol{-1.57}$ \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\subsection{Ablation Study}
+\label{sec:ablation}
+
+We ablate the core design choices of \method{}: the dynamic halting policy, the three stabilization mechanisms in Section~\ref{sec:stability}, and the size of the activation set. Unless stated otherwise, ablation tables use independently retrained same-protocol checkpoints; their purpose is to test mechanisms rather than to replace the canonical main estimate in Table~\ref{tab:main}.
+
+\textbf{Compute allocation.}\quad Table~\ref{tab:halt_dist} reports the deployed step distribution. For FLEURS and VoxPopuli, these numbers come from the canonical \texttt{activation\_500\_epoch10.pth} checkpoint. ASCEND is included only as an overlap-confounded same-protocol diagnostic. Its $5/500$ activation share is small, but the absence of speaker-disjoint enforcement means the heavier compute allocation is useful for inspecting the halting policy on accented/code-switched speech, not for claiming independent generalization.
+
+\begin{table}[th]
+  \caption{$N$-step distribution at the deployed setting $\theta{=}0.0$. FLEURS and VoxPopuli use the canonical 500-utterance checkpoint; ASCEND$^\dagger$ is an overlap-confounded same-protocol diagnostic.}
+  \label{tab:halt_dist}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l c r r r r}
+    \toprule
+    \textbf{Dataset} & \textbf{Skip ($\mathbf{N=0}$)} & \textbf{N=1} & \textbf{N=2} & \textbf{N=3} & \textbf{N=4} \\
+    \midrule
+    FLEURS (clean)      & 47.0\% & 24.9\% & 6.3\% & 4.8\% & 17.0\% \\
+    VoxPopuli (clean)   & 63.0\% & 22.0\% & 5.0\% & 2.2\% &  7.8\% \\
+    ASCEND$^\dagger$ (accented) & 22.3\% & 30.3\% & 8.2\% & 5.1\% & 34.1\% \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\textbf{Component Ablation: Stable Injection Mechanisms.}\quad
+Table~\ref{tab:component_ablation} selectively removes each stabilization mechanism in a same-protocol ablation suite. The ablations are independently retrained and demonstrate that the design is not redundant: removing the bounded delta is catastrophic, and removing either the anchor or the gate also causes large regressions.
+
+\begin{table}[th]
+  \caption{Component ablation on the three stabilization mechanisms (FLEURS \texttt{en\_us}, $\theta{=}0.0$). This is an independently retrained same-protocol ablation suite; deltas are against the frozen Baseline in the same evaluation pipeline.}
+  \label{tab:component_ablation}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l c c}
+    \toprule
+    \textbf{Variant} & \textbf{WER (\%)} & \textbf{$\Delta$WER (pp)} \\
+    \midrule
+    Full same-protocol \method{} ($N{=}4$) & \textbf{4.86} & $\boldsymbol{-0.04}$ \\
+    \quad $-$ bounded delta ($L_2$ + scale $s_k$) & 51.75 & $+46.85$ \\
+    \quad $-$ fixed-embedding anchor ($\mathbf{e}_{\texttt{LT}}$ removed) & 16.22 & $+11.33$ \\
+    \quad $-$ sigmoid gate ($g_k$ fixed at $1$) & 7.89 & $+2.99$ \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\textbf{Activation Set Scaling.}\quad
+Table~\ref{tab:activation_sweep} sweeps the activation-set size from $100$ to $800$ utterances in steps of $100$. The 500-utterance checkpoint is selected as the canonical main checkpoint because it gives the best mean absolute WER delta across FLEURS and VoxPopuli in this sweep. The useful range is narrow: several neighboring sizes are near-neutral or mildly regressive.
+
+\begin{table}[th]
+  \caption{Activation set scaling sweep ($\theta{=}0.0$). $\Delta$ (pp) is the absolute WER change vs.\ the Baseline; \textbf{Mean $\Delta$ (pp)} averages the two benchmarks.}
+  \label{tab:activation_sweep}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{c c c c c c}
+    \toprule
+    \textbf{Activation \#utts} & \textbf{FLEURS WER (\%)} & \textbf{$\Delta$ (pp)} & \textbf{VoxPopuli WER (\%)} & \textbf{$\Delta$ (pp)} & \textbf{Mean $\Delta$ (pp)} \\
+    \midrule
+    100 & 4.87 & $-0.03$ & 8.95 & $-0.08$ & $-0.055$ \\
+    200 & 4.91 & $+0.01$ & 9.01 & $-0.03$ & $-0.010$ \\
+    300 & 4.90 & $\phantom{-}0.00$ & 9.01 & $-0.03$ & $-0.015$ \\
+    400 & 4.91 & $+0.01$ & 9.04 & $\phantom{-}0.00$ & $+0.005$ \\
+    \textbf{500} & \textbf{4.78} & $\boldsymbol{-0.12}$ & 8.99 & $-0.04$ & $\boldsymbol{-0.084}$ \\
+    600 & 4.93 & $+0.03$ & 9.02 & $-0.02$ & $+0.005$ \\
+    700 & 4.82 & $-0.08$ & 9.04 & $\phantom{-}0.00$ & $-0.040$ \\
+    800 & 4.88 & $-0.02$ & 9.07 & $+0.04$ & $+0.010$ \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\subsection{Analysis}
+\label{sec:analysis}
+
+The aggregate gains are small, so we treat interpretability diagnostics carefully. The main checkpoint improves FLEURS more than VoxPopuli, while the same-protocol VoxPopuli diagnostic run shows the expected hard-tail pattern: improvements concentrate in the hardest quartile and are near-zero or mildly negative in easy bins. This supports a difficulty-conditional reading rather than a uniform accuracy-lift interpretation.
+
+\begin{table}[ht]
+  \caption{Difficulty-binned same-protocol diagnostic on VoxPopuli (\texttt{en}) at $\theta{=}0.0$ ($1{,}842$ utterances total). Utterances are partitioned into Baseline-WER quartiles.}
+  \label{tab:difficulty_bins}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l c c c c c}
+    \toprule
+    \textbf{Bin} & \textbf{\#utts} & \textbf{Baseline WER (\%)} & \textbf{\method{} WER (\%)} & \textbf{$\Delta$WER (pp)} & \textbf{Skip (\%)} \\
+    \midrule
+    Q1 (easiest)  & 460 &  0.00 &  0.06 & $+0.06$ & 51.3 \\
+    Q2            & 461 &  3.03 &  3.03 & $\phantom{-}0.00$ & 63.1 \\
+    Q3            & 460 &  8.93 & \textbf{8.91} & $-0.02$ & 64.3 \\
+    Q4 (hardest)  & 461 & 21.16 & \textbf{20.90} & $\boldsymbol{-0.25}$ & 62.0 \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\begin{table}[ht]
+  \caption{Value Head decision-quality diagnostic on VoxPopuli (\texttt{en}) at $\theta{=}0.0$. Counterfactual $\Delta$WER forces the $N{=}4$ latent path on each subset.}
+  \label{tab:gate_quality}
+  \centering
+  \resizebox{\columnwidth}{!}{
+  \begin{tabular}{l c c c}
+    \toprule
+    \textbf{Subset (at $\theta{=}0.0$)} & \textbf{\#utts} & \textbf{Actual $\Delta$WER (pp)} & \textbf{Counterfactual $\Delta$WER (pp)} \\
+    \midrule
+    Skipped ($v_0 < 0$)      & 1{,}109 & $0.00$ (by construction) & $+0.01$ \\
+    Processed ($v_0 \geq 0$) & 733 & $\boldsymbol{-0.19}$ & $-0.06$ \\
+    \bottomrule
+  \end{tabular}
+  }
+\end{table}
+
+\begin{table}[ht]
+  \caption{Qualitative examples from the VoxPopuli hard-quartile diagnostic. References are shown in lower-case unpunctuated form.}
+  \label{tab:qualitative}
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \renewcommand{\arraystretch}{1.1}
+  \begin{tabular}{@{}p{0.12\columnwidth} p{0.26\columnwidth} p{0.26\columnwidth} p{0.26\columnwidth}@{}}
+    \toprule
+    \textbf{Source} & \textbf{Reference} & \textbf{Baseline} & \textbf{\method{}} \\
+    \midrule
+    VoxPopuli Q4 & mr president thank you for your patience and indulgence. & Thank you, Mr. President. Thank you for your patience and indulgence. & Mr. President, thank you for your patience and indulgence. \\
+    \midrule
+    VoxPopuli Q4 & madam president i wish to focus my remarks on the european neighbourhood policy in relation to the middle east peace process. & Thank you, Madame President. Commissioner, I wish to focus my remarks on the European neighbourhood policy in relation to the Middle East peace process. & Madam President, I wish to focus my remarks on the European neighbourhood policy in relation to the Middle East peace process. \\
+    \midrule
+    VoxPopuli Q4 & mr president i would like to use this opportunity to say that i withdrew my name from this report. & Thank you, Mr. President. I would like to use the opportunity to say that I withdraw my name from this report. & Mr. President, I would like to use the opportunity to say that I withdraw my name from this report. \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Discussion}
+\label{sec:discussion}
+
+\textbf{Statistical scope.}\quad The clean main-benchmark gains in Table~\ref{tab:main} are below one tenth of a WER point on VoxPopuli and only slightly above one tenth of a point on FLEURS. With a single seed and no paired confidence interval, they are not distinguishable from evaluation noise. We therefore frame them as directional point estimates, not as statistically established improvements. ASCEND has an additional confound: although it accounts for only $5/500$ activation utterances ($1.0\%$), speaker-disjointness was not enforced, so its large CER reduction is not used as headline evidence. The remaining support for \method{} comes from the lower-risk pattern across mechanism diagnostics, noisy stress-suite results, and input-dependent compute allocation.
+
+\textbf{Where the gain comes from.}\quad The canonical main checkpoint reduces WER by $-0.124$~pp on FLEURS and $-0.043$~pp on VoxPopuli. The gains are therefore small in absolute terms, but the compute-allocation profile (Table~\ref{tab:halt_dist}) and the hard-tail diagnostic (Table~\ref{tab:difficulty_bins}) support a difficulty-conditional interpretation. On clean read-speech benchmarks, the Value Head skips roughly half or more of all utterances. The ASCEND row is compatible with this interpretation because it triggers more full-budget computation on accented/code-switched speech, but due to activation/test corpus overlap it should be read only as an in-domain diagnostic.
+
+\textbf{When dynamic halting matters.}\quad Dynamic halting is primarily a compute-allocation mechanism in this regime. At $\theta{=}0.0$, the canonical checkpoint uses $1.20$ average latent steps on FLEURS and $0.70$ on VoxPopuli, well below the full $N{=}4$ budget. This matters because the gain is not uniformly distributed: the model should spend compute where the frozen decoder leaves correctable residual errors and avoid spending it on low-yield utterances.
+
+\textbf{Minimal-data activation is narrow.}\quad The activation-set sweep (Table~\ref{tab:activation_sweep}) shows that the useful operating range is narrow. The 500-utterance checkpoint is best by mean WER delta in the sweep, but nearby settings are close and some larger settings are neutral or mildly regressive. We therefore do not claim monotonic improvement with more activation data. The claim is narrower: under conditions where standard adaptation regresses, a small activation set can produce a negative directional WER point estimate without modifying the backbone.
+
+\textbf{Failure modes and open questions.}\quad Several individual regressions merit explicit discussion. On the stress suite (Table~\ref{tab:stress_broad}), Common Voice, LibriSpeech, and People's Speech at $0$~dB all show small regressions ($\leq +0.32$~pp). This signals that the method is not uniformly beneficial across all difficulty regimes. Future work should replicate the main results with multi-seed statistical testing, rerun all diagnostics from a single frozen canonical checkpoint, and run a leave-ASCEND-out activation with speaker-disjoint evaluation before making any ASCEND generalization claim.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented \method{}, a parameter-efficient method that adds continuous latent test-time scaling to a frozen ASR backbone. Two small modules, a Latent Adapter that refines a few latent prefix positions through bounded recurrent updates and a Value Head that halts the loop per utterance, add under $1\%$ trainable parameters and leave the backbone untouched. Under a deliberately small activation regime where standard adaptation methods regress, \method{} gives the only negative single-run WER point estimate among the tested methods on both clean main benchmarks, but these clean-set deltas are too small to claim statistical significance without paired multi-seed testing. Same-protocol diagnostics suggest that the method behaves like a difficulty-conditional refinement loop with a learned scheduler. The ASCEND result is intentionally excluded from headline generalization claims because ASCEND contributes to the activation mixture and speaker-disjointness was not enforced.
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}

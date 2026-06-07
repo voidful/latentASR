@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+logs/
+eval_runs/
+wandb/
+*.log
+core
+*.tmp
+
+# Keep the released adapter checkpoint, ignore accidental large local artifacts.
+*.bin
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+!checkpoints/latentASR_adapter.pth
+

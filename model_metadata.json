@@ -1,0 +1,19 @@
+{
+  "project": "latentASR",
+  "model_repo": "voidful/latentASR",
+  "base_model": "Qwen/Qwen3-ASR-0.6B",
+  "checkpoint_file": "checkpoints/latentASR_adapter.pth",
+  "source_checkpoint": "activation_500_epoch10.pth",
+  "checkpoint_sha256": "f0ce39fa5e6952fced6992508f3e2b32ea8467442b545678781a0f04e64f2430",
+  "train_mode": "latent",
+  "n_latent": 4,
+  "train_max_samples": 500,
+  "adapter_parameters": 5251077,
+  "value_forced_neg_prob": 0.3,
+  "latent_use_bounded_delta": true,
+  "latent_use_injection_gate": true,
+  "latent_use_embedding_anchor": true,
+  "deployed_halt_threshold": 0.0,
+  "paper": "Listen, Think, Transcribe: Continuous Latent Test-Time Scaling for ASR"
+}
+
